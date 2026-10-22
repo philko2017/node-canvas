@@ -1,0 +1,9 @@
+{
+  "name": "node-canvas-tools",
+  "private": true,
+  "type": "module",
+  "description": "Excalidraw 節點畫布：Claude 自動排版 + 即時同步編輯",
+  "dependencies": {
+    "elkjs": "^0.10.2"
+  }
+}

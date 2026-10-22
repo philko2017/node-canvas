@@ -1,0 +1,323 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>節點畫布</title>
+    <script>
+      window.EXCALIDRAW_ASSET_PATH = "https://esm.sh/@excalidraw/excalidraw@0.18.0/dist/prod/";
+    </script>
+    <link rel="stylesheet" href="https://esm.sh/@excalidraw/excalidraw@0.18.0/dist/dev/index.css" />
+    <script type="importmap">
+      {
+        "imports": {
+          "react": "https://esm.sh/react@19.0.0",
+          "react/jsx-runtime": "https://esm.sh/react@19.0.0/jsx-runtime",
+          "react-dom": "https://esm.sh/react-dom@19.0.0",
+          "react-dom/client": "https://esm.sh/react-dom@19.0.0/client"
+        }
+      }
+    </script>
+    <style>
+      html, body, #app { height: 100%; margin: 0; }
+      #status {
+        position: fixed; left: 50%; bottom: 14px; transform: translateX(-50%); z-index: 10;
+        font: 12px/1.4 system-ui, sans-serif; color: #555; background: #fff;
+        border: 1px solid #ddd; border-radius: 6px; padding: 3px 10px; pointer-events: none;
+      }
+      /* 收合按鈕：疊在畫布上，跟著節點位置 */
+      #folds { position: fixed; inset: 0; pointer-events: none; z-index: 5; overflow: hidden; }
+      .fold {
+        position: absolute; pointer-events: auto; transform: translate(0, -50%);
+        min-width: 20px; height: 20px; padding: 0 5px; box-sizing: border-box;
+        border-radius: 10px; border: 1.5px solid #868e96; background: #fff; color: #343a40;
+        font: 700 12px/17px system-ui, sans-serif; text-align: center; cursor: pointer; user-select: none;
+      }
+      .fold:hover { border-color: #1971c2; color: #1971c2; }
+      .fold.closed { background: #1971c2; border-color: #1971c2; color: #fff; }
+      #foldbar {
+        position: fixed; right: 12px; top: 64px; z-index: 6; display: flex; flex-direction: column; gap: 6px;
+        font: 13px/1.3 system-ui, sans-serif; background: #fff; border: 1px solid #dee2e6; border-radius: 8px;
+        padding: 8px; box-shadow: 0 1px 4px rgba(0,0,0,.08);
+      }
+      #foldbar b { font-size: 12px; color: #495057; }
+      #foldbar button {
+        font: inherit; border: 1px solid #ced4da; background: #f8f9fa; border-radius: 6px; padding: 4px 8px; cursor: pointer; text-align: left;
+      }
+      #foldbar button:hover { background: #e7f5ff; border-color: #74c0fc; }
+      #foldbar label { font-size: 12px; color: #495057; display: flex; gap: 4px; align-items: center; }
+    </style>
+  </head>
+  <body>
+    <div id="app"></div>
+    <div id="folds"></div>
+    <div id="foldbar">
+      <b>分支</b>
+      <button data-fold="level" data-level="1">只看主幹</button>
+      <button data-fold="level" data-level="2">展開到第二層</button>
+      <button data-fold="expandAll">全部展開</button>
+      <label title="收合或展開後，自動把看得到的節點重新排整齊（鎖定的節點不動）"><input type="checkbox" id="autoLayout" checked />自動排版</label>
+    </div>
+    <div id="status">載入中…</div>
+    <script type="module">
+      import React from "react";
+      import { createRoot } from "react-dom/client";
+      import * as X from "https://esm.sh/@excalidraw/excalidraw@0.18.0/dist/dev/index.js?external=react,react-dom";
+
+      const { Excalidraw, restoreElements, serializeAsJSON, getSceneVersion, CaptureUpdateAction } = X;
+      const statusEl = document.getElementById("status");
+      const foldsEl = document.getElementById("folds");
+      const autoLayoutEl = document.getElementById("autoLayout");
+      const now = () => new Date().toLocaleTimeString("zh-TW", { hour12: false });
+      const setStatus = (t) => (statusEl.textContent = t);
+      try { autoLayoutEl.checked = localStorage.getItem("canvas.autoLayout") !== "0"; } catch (e) {}
+      autoLayoutEl.onchange = () => { try { localStorage.setItem("canvas.autoLayout", autoLayoutEl.checked ? "1" : "0"); } catch (e) {} };
+
+      let api = null;
+      let version = 0; // 伺服器上的檔案版本
+      let latestRemote = 0;
+      let baseline = -1; // 最後一次和檔案一致時的場景版本
+      let applyingRemote = false;
+      let saving = false;
+      let timer = null;
+      // 收合而隱藏的元素：不放進畫布，存檔時再併回去。owner＝負責它的收合節點，ownerPos 用來讓它跟著移動
+      let stash = []; // [{ el, owner }]
+      let ownerPos = new Map();
+      let foldInfo = { childCount: new Map(), hiddenCount: new Map(), collapsed: new Set() };
+
+      // ---- 收合：和 canvas.mjs 同一套規則（節點＝方框／橢圓／菱形；箭頭起點→終點就是父→子） ----
+      const NODE_TYPES = new Set(["rectangle", "ellipse", "diamond"]);
+      function analyze(elements) {
+        const els = elements.filter((e) => !e.isDeleted);
+        const shapes = new Map(els.filter((e) => NODE_TYPES.has(e.type)).map((e) => [e.id, e]));
+        const ch = new Map();
+        for (const a of els) {
+          if (a.type !== "arrow") continue;
+          const f = a.startBinding?.elementId, t = a.endBinding?.elementId;
+          if (!shapes.has(f) || !shapes.has(t) || f === t) continue;
+          if (!ch.has(f)) ch.set(f, []);
+          ch.get(f).push(t);
+        }
+        const collapsed = new Set([...shapes.values()].filter((e) => e.customData?.collapsed).map((e) => e.id));
+        const hidden = new Map(); // 節點 id → owner
+        for (const c of collapsed) {
+          const queue = [...(ch.get(c) ?? [])];
+          while (queue.length) {
+            const id = queue.shift();
+            if (id === c || hidden.has(id)) continue;
+            hidden.set(id, c);
+            queue.push(...(ch.get(id) ?? []));
+          }
+        }
+        for (const [id, o] of hidden) {
+          let x = o; const seen = new Set();
+          while (hidden.has(x) && !seen.has(x)) { seen.add(x); x = hidden.get(x); }
+          hidden.set(id, x);
+        }
+        const hiddenCount = new Map();
+        for (const o of hidden.values()) hiddenCount.set(o, (hiddenCount.get(o) ?? 0) + 1);
+        // 要藏的元素：隱藏的節點、它們的文字、接到它們的箭頭
+        const ownerOfEl = new Map();
+        for (const e of els) {
+          if (hidden.has(e.id)) ownerOfEl.set(e.id, hidden.get(e.id));
+          else if (e.type === "text" && hidden.has(e.containerId)) ownerOfEl.set(e.id, hidden.get(e.containerId));
+          else if (e.type === "arrow") {
+            const t = e.endBinding?.elementId, f = e.startBinding?.elementId;
+            if (hidden.has(t)) ownerOfEl.set(e.id, hidden.get(t));
+            else if (hidden.has(f)) ownerOfEl.set(e.id, hidden.get(f));
+          }
+        }
+        const childCount = new Map([...ch].map(([k, v]) => [k, v.length]));
+        return { ownerOfEl, childCount, hiddenCount, collapsed, shapes };
+      }
+
+      // 檔案內容 → 畫布要顯示的元素（隱藏的放進 stash）
+      function splitScene(elements) {
+        const info = analyze(elements);
+        stash = [];
+        ownerPos = new Map();
+        const visible = [];
+        for (const e of elements) {
+          const o = info.ownerOfEl.get(e.id);
+          if (o) stash.push({ el: e, owner: o });
+          else visible.push(e);
+        }
+        for (const o of new Set(stash.map((s) => s.owner))) {
+          const s = info.shapes.get(o);
+          if (s) ownerPos.set(o, { x: s.x, y: s.y });
+        }
+        foldInfo = info;
+        return visible;
+      }
+
+      // 存檔用：畫布上的元素＋隱藏的元素。收合節點被搬動，隱藏的分支跟著搬；收合節點被刪除，分支一起刪
+      function mergedElements() {
+        const visible = api.getSceneElements();
+        const byId = new Map(visible.map((e) => [e.id, e]));
+        const kept = [];
+        for (const s of stash) {
+          const o = byId.get(s.owner);
+          if (!o) continue;
+          const p = ownerPos.get(s.owner);
+          if (p && (o.x !== p.x || o.y !== p.y)) s.el = { ...s.el, x: s.el.x + o.x - p.x, y: s.el.y + o.y - p.y };
+          kept.push(s);
+        }
+        for (const o of new Set(kept.map((s) => s.owner))) {
+          const e = byId.get(o);
+          ownerPos.set(o, { x: e.x, y: e.y });
+        }
+        stash = kept;
+        return [...visible, ...kept.map((s) => s.el)];
+      }
+
+      // ---- 收合按鈕 ----
+      let lastAppState = null;
+      function drawFolds(appState = lastAppState) {
+        if (!api || !appState) return;
+        lastAppState = appState;
+        const z = appState.zoom?.value ?? 1;
+        const ox = appState.offsetLeft ?? 0, oy = appState.offsetTop ?? 0;
+        const html = [];
+        for (const e of api.getSceneElements()) {
+          if (!NODE_TYPES.has(e.type)) continue;
+          const n = foldInfo.childCount.get(e.id) ?? 0;
+          const closed = foldInfo.collapsed.has(e.id);
+          if (!n && !closed) continue;
+          const x = (e.x + e.width + appState.scrollX) * z + ox + 4;
+          const y = (e.y + e.height / 2 + appState.scrollY) * z + oy;
+          if (x < -40 || y < -40 || x > innerWidth + 40 || y > innerHeight + 40) continue;
+          const label = closed ? `+${foldInfo.hiddenCount.get(e.id) ?? n}` : "−";
+          const tip = closed ? "展開這個分支" : "收合這個分支";
+          html.push(`<div class="fold ${closed ? "closed" : ""}" data-id="${e.id}" title="${tip}" style="left:${x}px;top:${y}px">${label}</div>`);
+        }
+        foldsEl.innerHTML = html.join("");
+      }
+      function refreshFoldInfo() {
+        const info = analyze(mergedElements());
+        foldInfo = { ...foldInfo, childCount: info.childCount, collapsed: info.collapsed, hiddenCount: foldInfo.hiddenCount };
+      }
+
+      async function flushSave() {
+        clearTimeout(timer);
+        if (api && getSceneVersion(api.getSceneElements()) !== baseline) await save();
+        while (saving) await new Promise((r) => setTimeout(r, 50));
+      }
+      async function fold(body) {
+        setStatus("整理分支中…");
+        await flushSave();
+        const r = await fetch("/fold", {
+          method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ ...body, base: version, layout: autoLayoutEl.checked }),
+        });
+        if (r.status === 409) { await pullRemote(); setStatus("畫布剛更新過，請再按一次"); return; }
+        if (!r.ok) { setStatus("收合失敗：" + (await r.text())); return; }
+        await pullRemote(null, true);
+        setStatus("已存檔 " + now());
+      }
+      foldsEl.addEventListener("pointerdown", (ev) => {
+        const b = ev.target.closest(".fold");
+        if (!b) return;
+        ev.preventDefault(); ev.stopPropagation();
+        fold({ op: "toggle", id: b.dataset.id });
+      });
+      document.getElementById("foldbar").addEventListener("click", (ev) => {
+        const b = ev.target.closest("button");
+        if (!b) return;
+        fold(b.dataset.fold === "level" ? { op: "level", level: Number(b.dataset.level) } : { op: b.dataset.fold });
+      });
+
+      // ---- 存檔與同步 ----
+      async function fetchScene() {
+        const r = await fetch("/scene", { cache: "no-store" });
+        return r.json();
+      }
+
+      function onChange(elements, appState) {
+        drawFolds(appState);
+        const sv = getSceneVersion(elements);
+        if (baseline === -1 || applyingRemote) { baseline = sv; return; }
+        if (sv === baseline) return; // 只是捲動、選取
+        setStatus("編輯中…");
+        clearTimeout(timer);
+        timer = setTimeout(save, 600);
+      }
+
+      async function save() {
+        if (saving) { timer = setTimeout(save, 300); return; }
+        saving = true;
+        try {
+          const sv = getSceneVersion(api.getSceneElements());
+          const elements = mergedElements();
+          const body = serializeAsJSON(elements, api.getAppState(), api.getFiles(), "local");
+          const r = await fetch("/scene?base=" + version, { method: "PUT", body, headers: { "content-type": "application/json" } });
+          if (r.status === 409) {
+            await pullRemote("Claude 剛好也改了畫布，你最後幾秒的修改沒存到，請再做一次");
+            return;
+          }
+          if (!r.ok) throw new Error(await r.text());
+          version = (await r.json()).version;
+          baseline = sv;
+          refreshFoldInfo();
+          drawFolds();
+          setStatus("已存檔 " + now());
+        } catch (err) {
+          setStatus("存檔失敗：" + err.message);
+        } finally {
+          saving = false;
+        }
+        if (latestRemote > version) pullRemote();
+      }
+
+      async function pullRemote(message, quiet) {
+        const data = await fetchScene();
+        applyingRemote = true;
+        const all = restoreElements(data.scene.elements, null, { repairBindings: true });
+        const elements = splitScene(all);
+        api.updateScene({ elements, captureUpdate: CaptureUpdateAction?.IMMEDIATELY });
+        version = data.version;
+        clearTimeout(timer);
+        setTimeout(() => {
+          baseline = getSceneVersion(api.getSceneElements());
+          applyingRemote = false;
+          drawFolds();
+        }, 100);
+        if (message) api.setToast({ message, closable: true, duration: 8000 });
+        else if (!quiet) api.setToast({ message: "Claude 已更新畫布（Ctrl+Z 可以復原）", duration: 4000 });
+        setStatus("已同步 " + now());
+      }
+
+      const initial = await fetchScene();
+      version = latestRemote = initial.version;
+      document.title = initial.name.replace(/\.excalidraw$/, "") + "｜節點畫布";
+
+      const events = new EventSource("/events");
+      events.onmessage = (ev) => {
+        latestRemote = JSON.parse(ev.data).version;
+        if (api && !saving && latestRemote > version) pullRemote();
+        setStatus("已連線 " + now());
+      };
+      events.onerror = () => setStatus("和伺服器斷線，重新連線中…");
+
+      const initialVisible = splitScene(initial.scene.elements);
+      createRoot(document.getElementById("app")).render(
+        React.createElement(Excalidraw, {
+          excalidrawAPI: (a) => {
+            api = a;
+            setTimeout(() => { a.scrollToContent(undefined, { fitToContent: true }); drawFolds(a.getAppState()); }, 300); // 開啟時看到整張圖
+          },
+          initialData: {
+            elements: initialVisible,
+            appState: { ...(initial.scene.appState ?? {}), collaborators: new Map() },
+            files: initial.scene.files,
+            scrollToContent: true,
+          },
+          langCode: "zh-TW",
+          onChange,
+          onScrollChange: () => api && drawFolds(api.getAppState()),
+        }),
+      );
+      addEventListener("resize", () => api && drawFolds(api.getAppState()));
+      setStatus("已載入 " + initial.name);
+    </script>
+  </body>
+</html>
