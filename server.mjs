@@ -34,7 +34,8 @@ if (!fs.existsSync(file)) {
 }
 const url = `http://localhost:${port}`;
 
-const openUrl = () => spawn('cmd', ['/c', 'start', '', url], { detached: true, stdio: 'ignore' }).unref();
+const openCmd = { win32: ['cmd', ['/c', 'start', '', url]], darwin: ['open', [url]] }[process.platform] ?? ['xdg-open', [url]];
+const openUrl = () => spawn(openCmd[0], openCmd[1], { detached: true, stdio: 'ignore' }).unref();
 
 let content = fs.readFileSync(file, 'utf8');
 let version = 1;

@@ -116,11 +116,12 @@
         }
         const hiddenCount = new Map();
         for (const o of hidden.values()) hiddenCount.set(o, (hiddenCount.get(o) ?? 0) + 1);
-        // 要藏的元素：隱藏的節點、它們的文字、接到它們的箭頭
+        // 要藏的元素：隱藏的節點、它們的文字和圖片、接到它們的箭頭
         const ownerOfEl = new Map();
         for (const e of els) {
           if (hidden.has(e.id)) ownerOfEl.set(e.id, hidden.get(e.id));
           else if (e.type === "text" && hidden.has(e.containerId)) ownerOfEl.set(e.id, hidden.get(e.containerId));
+          else if (hidden.has(e.customData?.attachedTo)) ownerOfEl.set(e.id, hidden.get(e.customData.attachedTo)); // 掛在節點下方的圖片
           else if (e.type === "arrow") {
             const t = e.endBinding?.elementId, f = e.startBinding?.elementId;
             if (hidden.has(t)) ownerOfEl.set(e.id, hidden.get(t));
@@ -273,6 +274,7 @@
         applyingRemote = true;
         const all = restoreElements(data.scene.elements, null, { repairBindings: true });
         const elements = splitScene(all);
+        api.addFiles(Object.values(data.scene.files ?? {})); // Claude 新加的圖片
         api.updateScene({ elements, captureUpdate: CaptureUpdateAction?.IMMEDIATELY });
         version = data.version;
         clearTimeout(timer);

@@ -4,6 +4,7 @@
 //   node canvas.mjs read  <檔案.excalidraw> [--pos]   列出節點樹（含 id、說明、鎖定狀態）
 //   node canvas.mjs apply <檔案.excalidraw> <ops.json> 套用變更並排版
 //   node canvas.mjs new   <檔案.excalidraw>           建立空白畫布
+//   node canvas.mjs import <檔案.xmind> <新畫布.excalidraw>  把 Xmind 心智圖轉成新畫布（保留收合，圖片掛在節點下方）
 //
 // 每次修改前的備份放在畫布旁邊的 .canvas-history/ 資料夾。給 AI 的完整操作說明見 AGENTS.md
 //
@@ -15,9 +16,11 @@
 //   "remove":  ["<節點>"],
 //   "update":  [{ "node": "<節點>", "name": "新名稱", "desc": "新說明", "color": "#a5d8ff" }],
 //   "add":     [{ "key": "暫時代號", "name": "名稱", "desc": "說明", "parent": "<節點>", "color": "#b2f2bb" }],
+//   "move":    [{ "node": "<節點>", "parent": "<節點>" }],  // 連同底下整個分支搬到新的上層，依順序排在最後
 //   "connect": [{ "from": "<節點>", "to": "<節點>" }],
 //   "layout":  "new" | "all" | "none",   // 預設 new：只排新節點，既有位置不動；all：全部重排（鎖定的不動）
-//   "direction": "RIGHT" | "DOWN"         // 預設 RIGHT
+//   "direction": "RIGHT" | "DOWN",        // 預設 RIGHT
+//   "font": "Nunito" | "Excalifont"       // 整張畫布的節點換字型（預設新節點用 Nunito＝黑體）
 // }
 // <節點> 可以是 id、同一份 ops 裡的 key，或名稱（名稱重複時要用 id）。
 //
@@ -28,19 +31,31 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import zlib from 'node:zlib';
+import os from 'node:os';
+import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import ELK from 'elkjs/lib/elk.bundled.js';
 
 const NODE_TYPES = new Set(['rectangle', 'ellipse', 'diamond']);
 const NODE_W = 280;
 const FONT_SIZE = 16;
-const LINE_HEIGHT = 1.25;
-const FONT_FAMILY = 5; // Excalifont，中文會自動用手寫風的小賴字體
+// Excalidraw 的字型代號和行高（行高要和 Excalidraw 一致，文字才不會跑出方框）
+const FONTS = {
+  Excalifont: { id: 5, lineHeight: 1.25 }, // 手寫風，中文用小賴字體
+  Nunito: { id: 6, lineHeight: 1.35 }, // 一般，中文用電腦內建的黑體（Mac 蘋方、Windows 微軟正黑體）
+};
+const DEFAULT_FONT = FONTS.Nunito;
+const FONT_FAMILY = DEFAULT_FONT.id;
+const LINE_HEIGHT = DEFAULT_FONT.lineHeight;
 const PAD = 5; // Excalidraw 綁定文字的固定內距
 const V_PAD = 18; // 文字上下額外留白
 const GAP_LAYER = 100; // 層與層之間
 const GAP_SIBLING = 32; // 同層節點之間
 const ARROW_GAP = 6;
+const IMG_GAP = 8; // 節點和下方圖片的距離
+const IMG_MAX_W = 360; // 圖片在畫布上的最大寬度
+const IMG_MAX_PX = 1200; // 匯入時圖片縮到最長邊這麼多像素，畫布檔才不會太大
 const PALETTE = ['#ffec99', '#a5d8ff', '#b2f2bb', '#d0bfff', '#ffc9c9'];
 const ALPHABET = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
 
@@ -196,6 +211,8 @@ export function readGraph(scene) {
     const [first = '', ...rest] = raw.split('\n');
     nodes.set(el.id, { id: el.id, el, text, name: first.trim(), desc: rest.join('\n').trim() });
   }
+  // 掛在節點下方的圖片（customData.attachedTo），排版時跟著節點走
+  for (const im of els) if (im.type === 'image' && nodes.has(im.customData?.attachedTo)) nodes.get(im.customData.attachedTo).image = im;
   const notes = els.filter((e) => e.type === 'text' && !e.containerId);
   const looseArrows = arrows.filter((a) => !edges.some((e) => e.arrow === a));
   return { nodes, edges, notes, looseArrows };
@@ -226,7 +243,7 @@ function cmdRead(file, opts) {
   const seen = new Set();
   const line = (n, depth) => {
     const pad = '  '.repeat(depth);
-    const lock = (n.el.locked ? ' 🔒' : '') + (isCollapsed(n) ? ' ⊕已收合' : '');
+    const lock = (n.el.locked ? ' 🔒' : '') + (isCollapsed(n) ? ' ⊕已收合' : '') + (n.image ? ' 🖼' : '');
     const pos = opts.pos ? ` @${Math.round(n.el.x)},${Math.round(n.el.y)} ${Math.round(n.el.width)}×${Math.round(n.el.height)}` : '';
     out.push(`${pad}${depth ? '→ ' : ''}${n.name || '（未命名）'}  [${n.id}]${lock}${pos}`);
     if (n.desc) for (const d of n.desc.split('\n')) out.push(`${pad}${depth ? '  ' : ''}  │ ${d}`);
@@ -363,7 +380,7 @@ async function elkLayout(g, direction) {
       'elk.layered.nodePlacement.strategy': 'BRANDES_KOEPF',
       'elk.layered.nodePlacement.bk.fixedAlignment': 'BALANCED', // 父節點對齊子節點群的中間
     },
-    children: ids.map((id) => ({ id, width: g.nodes.get(id).el.width, height: g.nodes.get(id).el.height })),
+    children: ids.map((id) => ({ id, width: boxW(g.nodes.get(id)), height: boxH(g.nodes.get(id)) })),
     edges: g.edges
       .filter((e) => e.from !== e.to && g.nodes.has(e.from) && g.nodes.has(e.to))
       .map((e, i) => ({ id: `e${i}`, sources: [e.from], targets: [e.to] })),
@@ -372,13 +389,16 @@ async function elkLayout(g, direction) {
   return new Map(res.children.map((c) => [c.id, { x: c.x, y: c.y }]));
 }
 
-const rectOf = (el, x = el.x, y = el.y) => ({ x, y, w: el.width, h: el.height });
+// 節點占的範圍：方框加上掛在下方的圖片
+const boxW = (n) => Math.max(n.el.width, n.image?.width ?? 0);
+const boxH = (n) => n.el.height + (n.image ? IMG_GAP + n.image.height : 0);
+const rectOf = (n, x = n.el.x, y = n.el.y) => ({ x, y, w: boxW(n), h: boxH(n) });
 const overlaps = (a, b, m) => a.x < b.x + b.w + m && b.x < a.x + a.w + m && a.y < b.y + b.h + m && b.y < a.y + a.h + m;
 
 // 只排新節點：整群新節點照 ELK 的相對位置掛在既有的父節點旁，撞到就往旁邊挪
 function placeNew(g, elkPos, newIds, direction, preferredAnchor) {
   const moved = new Set();
-  const placed = [...g.nodes.values()].filter((n) => !newIds.has(n.id)).map((n) => rectOf(n.el));
+  const placed = [...g.nodes.values()].filter((n) => !newIds.has(n.id)).map((n) => rectOf(n));
   const adj = new Map();
   for (const e of g.edges) {
     for (const [a, b] of [[e.from, e.to], [e.to, e.from]]) {
@@ -415,7 +435,7 @@ function placeNew(g, elkPos, newIds, direction, preferredAnchor) {
     }
     // 撞到既有節點就沿著「同層」方向挪開
     for (let i = 0; i < 500; i++) {
-      const rects = group.map((id) => rectOf(g.nodes.get(id).el, elkPos.get(id).x + dx, elkPos.get(id).y + dy));
+      const rects = group.map((id) => rectOf(g.nodes.get(id), elkPos.get(id).x + dx, elkPos.get(id).y + dy));
       const r = rects.find((rr) => placed.some((p) => overlaps(rr, p, GAP_SIBLING / 2)));
       if (!r) break;
       const p = placed.find((pp) => overlaps(r, pp, GAP_SIBLING / 2));
@@ -426,7 +446,7 @@ function placeNew(g, elkPos, newIds, direction, preferredAnchor) {
       const el = g.nodes.get(id).el;
       el.x = Math.round(elkPos.get(id).x + dx);
       el.y = Math.round(elkPos.get(id).y + dy);
-      placed.push(rectOf(el));
+      placed.push(rectOf(g.nodes.get(id)));
       moved.add(id);
     }
   }
@@ -454,7 +474,7 @@ function placeAll(g, elkPos) {
   }
   const warn = [];
   for (const l of locked) {
-    for (const n of nodes) if (n !== l && !n.el.locked && overlaps(rectOf(l.el), rectOf(n.el), 0)) warn.push(`「${l.name}」（鎖定）和「${n.name}」重疊`);
+    for (const n of nodes) if (n !== l && !n.el.locked && overlaps(rectOf(l), rectOf(n), 0)) warn.push(`「${l.name}」（鎖定）和「${n.name}」重疊`);
   }
   return { moved, warn };
 }
@@ -524,6 +544,13 @@ async function cmdApply(file, opsFile) {
   const ops = JSON.parse(fs.readFileSync(opsFile, 'utf8'));
   const { scene, mtime } = loadScene(file);
   checkLastAdded(file, scene);
+  const { report, newIds, g } = await applyOps(scene, ops);
+  writeScene(file, scene, mtime);
+  saveHistory(file, ops, [...newIds].map((id) => ({ id, name: g.nodes.get(id)?.name })));
+  console.log(report.join('\n') || '沒有變更');
+}
+
+async function applyOps(scene, ops) {
   const direction = ops.direction === 'DOWN' ? 'DOWN' : 'RIGHT';
   let g = readGraph(scene);
   const keys = new Map();
@@ -548,7 +575,7 @@ async function cmdApply(file, opsFile) {
       for (const e of g.edges) if (e.from === id && !ids.has(e.to)) { ids.add(e.to); queue.push(e.to); }
     }
     const drop = new Set();
-    for (const id of ids) { drop.add(id); if (g.nodes.get(id).text) drop.add(g.nodes.get(id).text.id); }
+    for (const id of ids) { const n = g.nodes.get(id); drop.add(id); if (n.text) drop.add(n.text.id); if (n.image) drop.add(n.image.id); }
     for (const e of g.edges) if (ids.has(e.from) || ids.has(e.to)) drop.add(e.arrow.id);
     scene.elements = scene.elements.filter((e) => !drop.has(e.id));
     report.push(`刪除「${g.nodes.get(top).name}」及底下 ${ids.size - 1} 個節點`);
@@ -557,7 +584,7 @@ async function cmdApply(file, opsFile) {
   for (const ref of ops.remove ?? []) {
     const id = resolve(ref);
     const n = g.nodes.get(id);
-    const drop = new Set([id, n.text?.id]);
+    const drop = new Set([id, n.text?.id, n.image?.id]);
     for (const e of g.edges) if (e.from === id || e.to === id) drop.add(e.arrow.id);
     scene.elements = scene.elements.filter((e) => !drop.has(e.id));
     report.push(`刪除「${n.name}」`);
@@ -587,6 +614,23 @@ async function cmdApply(file, opsFile) {
   const newIds = new Set();
   const preferredAnchor = new Map();
   const newArrows = [];
+
+  // 2b. 整張畫布換字型（節點變高時，相連的箭頭重新拉線）
+  if (ops.font) {
+    const f = FONTS[ops.font];
+    if (!f) throw new Error(`不認得的字型「${ops.font}」，可以用：${Object.keys(FONTS).join('、')}`);
+    let count = 0;
+    for (const n of g.nodes.values()) {
+      if (!n.text || (n.text.fontFamily === f.id && n.text.lineHeight === f.lineHeight)) continue;
+      n.text.fontFamily = f.id;
+      n.text.lineHeight = f.lineHeight;
+      fitText(n.el, n.text, n.text.originalText ?? n.text.text);
+      for (const e of g.edges) if (e.from === n.id || e.to === n.id) newArrows.push(e.arrow.id);
+      count++;
+    }
+    scene.appState = { ...(scene.appState ?? {}), currentItemFontFamily: f.id }; // 在畫布上新打的字也用這個字型
+    report.push(`${count} 個節點換成 ${ops.font}`);
+  }
   for (const a of ops.add ?? []) {
     const parentId = a.parent ? resolve(a.parent) : null;
     if (parentId && setCollapsed(g.nodes.get(parentId), false)) report.push(`展開「${g.nodes.get(parentId).name}」（要在底下新增節點）`);
@@ -611,6 +655,30 @@ async function cmdApply(file, opsFile) {
     g = readGraph(scene);
   }
 
+  // 3b. 搬移：節點連同底下整個分支（文字、圖片）改接到新的上層。依 move 的順序排在新上層的最後面
+  for (const m of ops.move ?? []) {
+    const id = resolve(m.node);
+    const parentId = resolve(m.parent);
+    const sub = new Set([id]);
+    const queue = [id];
+    while (queue.length) {
+      const x = queue.shift();
+      for (const e of g.edges) if (e.from === x && !sub.has(e.to)) { sub.add(e.to); queue.push(e.to); }
+    }
+    if (sub.has(parentId)) throw new Error(`不能把「${g.nodes.get(id).name}」搬到它自己的分支底下`);
+    const n = g.nodes.get(id);
+    const drop = new Set(g.edges.filter((e) => e.to === id).map((e) => e.arrow.id));
+    const own = new Set([n.el.id, n.text?.id, n.image?.id]);
+    const moved = scene.elements.filter((e) => own.has(e.id));
+    scene.elements = scene.elements.filter((e) => !drop.has(e.id) && !own.has(e.id));
+    scene.elements.push(...moved); // 移到最後，排版時才會排在兄弟節點的後面
+    const arrow = newArrow(g.nodes.get(parentId).el, n.el);
+    scene.elements.push(arrow);
+    newArrows.push(arrow.id);
+    report.push(`搬移「${n.name}」→ 接在「${g.nodes.get(parentId).name}」後面`);
+    g = readGraph(scene);
+  }
+
   // 4. 新增連線
   for (const c of ops.connect ?? []) {
     const from = resolve(c.from);
@@ -624,13 +692,166 @@ async function cmdApply(file, opsFile) {
 
   // 5～6. 排版、文字跟著走、箭頭重新拉線
   report.push(...(await arrange(scene, g, { layout: ops.layout ?? 'new', direction, newIds, preferredAnchor, newArrows })));
-  writeScene(file, scene, mtime);
-  saveHistory(file, ops, [...newIds].map((id) => ({ id, name: g.nodes.get(id)?.name })));
-  console.log(report.join('\n') || '沒有變更');
+  return { report, newIds, keys, g };
+}
+
+// ---------- 匯入 Xmind ----------
+
+// 從 zip 取出一個檔案（.xmind 是 zip），不用額外套件
+function unzipEntry(buf, wanted) {
+  let eocd = buf.length - 22;
+  while (eocd >= 0 && buf.readUInt32LE(eocd) !== 0x06054b50) eocd--;
+  if (eocd < 0) throw new Error('不是有效的 .xmind 檔（讀不到 zip 結構）');
+  let p = buf.readUInt32LE(eocd + 16);
+  const count = buf.readUInt16LE(eocd + 10);
+  for (let i = 0; i < count; i++) {
+    const method = buf.readUInt16LE(p + 10);
+    const size = buf.readUInt32LE(p + 20);
+    const nameLen = buf.readUInt16LE(p + 28);
+    const extraLen = buf.readUInt16LE(p + 30);
+    const commentLen = buf.readUInt16LE(p + 32);
+    const local = buf.readUInt32LE(p + 42);
+    const name = buf.toString('utf8', p + 46, p + 46 + nameLen);
+    if (name === wanted) {
+      const start = local + 30 + buf.readUInt16LE(local + 26) + buf.readUInt16LE(local + 28);
+      const data = buf.subarray(start, start + size);
+      return method === 0 ? data : zlib.inflateRawSync(data);
+    }
+    p += 46 + nameLen + extraLen + commentLen;
+  }
+  return null;
+}
+
+// 圖片的像素大小（PNG、JPEG、GIF），讀不到回傳 null
+function imageSize(b) {
+  if (b.readUInt32BE(0) === 0x89504e47) return { w: b.readUInt32BE(16), h: b.readUInt32BE(20) };
+  if (b.toString('ascii', 0, 3) === 'GIF') return { w: b.readUInt16LE(6), h: b.readUInt16LE(8) };
+  if (b[0] === 0xff && b[1] === 0xd8) {
+    for (let p = 2; p + 9 < b.length; ) {
+      if (b[p] !== 0xff) { p++; continue; }
+      const m = b[p + 1];
+      if (m >= 0xc0 && m <= 0xcf && m !== 0xc4 && m !== 0xc8 && m !== 0xcc) return { w: b.readUInt16BE(p + 7), h: b.readUInt16BE(p + 5) };
+      p += 2 + b.readUInt16BE(p + 2);
+    }
+  }
+  return null;
+}
+
+// 大圖縮小（macOS 用 sips、Windows 用 PowerShell），做不到就用原圖
+function shrinkImage(buf, ext, size) {
+  if (!size || Math.max(size.w, size.h) <= IMG_MAX_PX) return { buf, size };
+  const k = IMG_MAX_PX / Math.max(size.w, size.h);
+  const next = { w: Math.round(size.w * k), h: Math.round(size.h * k) };
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'canvas-img-'));
+  const src = path.join(dir, `in.${ext}`);
+  const out = path.join(dir, `out.${ext}`);
+  try {
+    fs.writeFileSync(src, buf);
+    if (process.platform === 'darwin') execFileSync('sips', ['-z', String(next.h), String(next.w), src, '--out', out], { stdio: 'ignore' });
+    else if (process.platform === 'win32') {
+      const fmt = ext === 'png' ? 'Png' : ext === 'gif' ? 'Gif' : 'Jpeg';
+      const ps = `Add-Type -AssemblyName System.Drawing; $i=[Drawing.Image]::FromFile('${src}'); $b=New-Object Drawing.Bitmap $i,${next.w},${next.h}; $b.Save('${out}',[Drawing.Imaging.ImageFormat]::${fmt}); $b.Dispose(); $i.Dispose()`;
+      execFileSync('powershell', ['-NoProfile', '-Command', ps], { stdio: 'ignore' });
+    } else return { buf, size };
+    const small = fs.readFileSync(out);
+    return small.length < buf.length ? { buf: small, size: next } : { buf, size };
+  } catch {
+    return { buf, size };
+  } finally {
+    for (const f of [src, out]) if (fs.existsSync(f)) fs.unlinkSync(f); // 不用 rmSync：Node 24 在 Windows 遇到中文路徑會崩潰
+    fs.rmdirSync(dir);
+  }
+}
+
+const MIME = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', svg: 'image/svg+xml', webp: 'image/webp' };
+
+// Xmind 主題的圖片 → 畫布檔的 files 項目＋圖片元素（掛在節點下方，和節點同一個群組，拖節點時一起動）
+function attachImage(scene, n, image, buf) {
+  const name = image.src.replace(/^xap:/, '');
+  let data = unzipEntry(buf, name);
+  if (!data) return false;
+  const ext = path.extname(name).slice(1).toLowerCase();
+  let size = imageSize(data);
+  ({ buf: data, size } = shrinkImage(data, ext, size));
+  const fileId = crypto.createHash('sha1').update(data).digest('hex');
+  scene.files[fileId] ??= { mimeType: MIME[ext] ?? 'image/png', id: fileId, dataURL: `data:${MIME[ext] ?? 'image/png'};base64,${data.toString('base64')}`, created: Date.now() };
+  // 顯示大小：照 Xmind 設定的，沒有就用像素大小，最寬 IMG_MAX_W
+  const ratio = size ? size.h / size.w : (image.height && image.width ? image.height / image.width : 0.75);
+  const w = Math.min(IMG_MAX_W, image.width ?? size?.w ?? NODE_W);
+  const group = newId();
+  const el = baseElement('image', {
+    width: Math.round(w), height: Math.round(w * ratio), fileId, status: 'saved', scale: [1, 1], crop: null,
+    strokeColor: 'transparent', groupIds: [group], customData: { attachedTo: n.id },
+  });
+  n.el.groupIds = [group];
+  if (n.text) n.text.groupIds = [group];
+  scene.elements.push(el);
+  return true;
+}
+
+// Xmind 主題 → 名稱＋說明。多行標題：第一行當名稱；很長的單行「名稱：內容」從冒號切開
+function topicText(t) {
+  const title = (t.title ?? '').replace(/\r/g, '').trim();
+  let [name = '', ...rest] = title.split('\n');
+  let desc = rest.join('\n').trim();
+  const m = !desc && name.length > 30 && name.match(/^(.{1,12}?)[：:]\s*(.+)$/s);
+  if (m) { name = m[1]; desc = m[2]; }
+  const extra = [];
+  if (t.labels?.length) extra.push(`標籤：${t.labels.join('、')}`);
+  if (t.href) extra.push(t.href);
+  const note = t.notes?.plain?.content?.replace(/\r/g, '').trim();
+  if (note) extra.push(`備註：${note}`);
+  desc = [desc, ...extra].filter(Boolean).join('\n');
+  if (!name.trim()) name = t.image ? '（圖片）' : '（未命名）';
+  return { name: name.trim(), desc };
+}
+
+async function cmdImport(xmindFile, file) {
+  if (fs.existsSync(file)) throw new Error(`${file} 已存在，請換一個畫布檔名`);
+  const buf = fs.readFileSync(xmindFile);
+  const json = unzipEntry(buf, 'content.json');
+  if (!json) throw new Error('這是舊版 Xmind 8 的格式，請先用新版 Xmind 打開再存檔一次');
+  const sheets = JSON.parse(json.toString('utf8'));
+
+  const ops = { add: [], layout: 'none' };
+  const folded = [];
+  const images = [];
+  let n = 0;
+  const walk = (t, parent) => {
+    const key = `x${n++}`;
+    const { name, desc } = topicText(t);
+    if (t.image?.src) images.push({ key, image: t.image });
+    ops.add.push({ key, name, desc, parent });
+    if (t.branch === 'folded') folded.push(key);
+    for (const c of t.children?.attached ?? []) walk(c, key);
+    // 摘要（summary）當作被摘要那一層的子節點；浮動主題（detached）當作另外的根
+    for (const s of t.children?.summary ?? []) walk(s, key);
+    for (const d of t.children?.detached ?? []) if (!d.titleUnedited || d.children) walk(d, null); // 沒改過字的空白浮動主題不要
+  };
+  for (const s of sheets) walk(s.rootTopic, null);
+
+  const scene = blankScene();
+  const { keys } = await applyOps(scene, ops);
+  let g = readGraph(scene);
+  for (const k of folded) setCollapsed(g.nodes.get(keys.get(k)), true);
+  let lost = 0;
+  for (const im of images) if (!attachImage(scene, g.nodes.get(keys.get(im.key)), im.image, buf)) lost++;
+  g = readGraph(scene);
+  await arrange(scene, g, { layout: 'all', direction: 'RIGHT' });
+
+  const tmp = `${file}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(scene, null, 2));
+  fs.renameSync(tmp, file);
+  const rel = sheets.reduce((s, sh) => s + (sh.relationships?.length ?? 0), 0);
+  console.log(`已匯入 ${sheets.length} 張工作表、${ops.add.length} 個節點 → ${file}`);
+  if (folded.length) console.log(`照 Xmind 收合了 ${folded.length} 個分支`);
+  if (images.length) console.log(`匯入 ${images.length - lost} 張圖片（放在節點下方）`);
+  if (lost) console.log(`⚠ ${lost} 張圖片在 .xmind 裡找不到，沒有匯入`);
+  if (rel) console.log(`⚠ ${rel} 條關係線（relationship）沒有匯入`);
 }
 
 // 排版：收合而隱藏的節點不參加，跟著負責它的收合節點一起移動
-async function arrange(scene, g, { layout, direction, newIds = new Set(), preferredAnchor = new Map(), newArrows = [] }) {
+export async function arrange(scene, g, { layout, direction, newIds = new Set(), preferredAnchor = new Map(), newArrows = [] }) {
   const report = [];
   const { hidden } = foldInfo(g);
   const vg = visibleGraph(g, hidden);
@@ -662,6 +883,11 @@ async function arrange(scene, g, { layout, direction, newIds = new Set(), prefer
   const reroute = new Set(newArrows);
   for (const e of g.edges) if (moved.has(e.from) || moved.has(e.to)) reroute.add(e.arrow.id);
   for (const e of g.edges) if (reroute.has(e.arrow.id)) routeArrow(e.arrow, g.nodes.get(e.from).el, g.nodes.get(e.to).el);
+  for (const n of g.nodes.values()) {
+    if (!n.image) continue;
+    const x = n.el.x, y = n.el.y + n.el.height + IMG_GAP;
+    if (n.image.x !== x || n.image.y !== y) { n.image.x = x; n.image.y = y; touch(n.image); }
+  }
   syncBindings(scene);
   return report;
 }
@@ -737,8 +963,9 @@ if (isMain) try {
   if (cmd === 'read' && file) cmdRead(file, { pos: process.argv.includes('--pos') });
   else if (cmd === 'apply' && file && arg) await cmdApply(file, arg);
   else if (cmd === 'new' && file) cmdNew(file);
+  else if (cmd === 'import' && file && arg) await cmdImport(file, arg);
   else {
-    console.log('用法：node canvas.mjs read <檔案> [--pos] | apply <檔案> <ops.json> | new <檔案>');
+    console.log('用法：node canvas.mjs read <檔案> [--pos] | apply <檔案> <ops.json> | new <檔案> | import <檔案.xmind> <新畫布.excalidraw>');
     process.exitCode = 1;
   }
 } catch (err) {
